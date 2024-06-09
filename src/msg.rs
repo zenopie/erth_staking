@@ -13,7 +13,7 @@ pub struct InstantiateMsg {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 pub struct AllocationPercentage {
-    pub contract: Addr,
+    pub address: Addr,
     pub percentage: Uint128,
 }
 
@@ -27,8 +27,7 @@ pub enum ExecuteMsg {
         percentages: Vec<AllocationPercentage>,
     },
     AddAllocationOption {
-        contract: Addr,
-        hash: String,
+        address: Addr,
     },
     Receive {
         sender: Addr,
@@ -50,11 +49,17 @@ pub enum ReceiveMsg {
 pub enum QueryMsg {
     GetState {},
     GetAllocation {address: Addr},
+    GetAllocationOptions {},
 }
 // We define a custom struct for each query response
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 pub struct StateResponse {
     pub state: State,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct AllocationOptionResponse {
+    pub allocations: Vec<Allocation>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]

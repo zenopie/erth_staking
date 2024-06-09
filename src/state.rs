@@ -18,8 +18,7 @@ pub static STATE: Item<State> = Item::new(b"state");
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 pub struct Allocation {
-    pub contract: Addr,
-    pub hash: String,
+    pub address: Addr,
     pub amount: Uint128,
 }
 

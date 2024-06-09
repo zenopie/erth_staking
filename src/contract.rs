@@ -5,7 +5,7 @@ use cosmwasm_std::{
 };
 
 use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg, StateResponse, Snip20Msg,
-    ReceiveMsg, AllocationPercentage, AllocationResponse,
+    ReceiveMsg, AllocationPercentage, AllocationResponse, AllocationOptionResponse,
 };
 use crate::state::{STATE, State, DEPOSIT_AMOUNTS, ALLOCATION_OPTIONS, INDIVIDUAL_ALLOCATIONS, 
     Allocation, INDIVIDUAL_PERCENTAGES,
@@ -25,8 +25,10 @@ pub fn instantiate(
         total_deposits: Uint128::zero(),
         total_allocations: Uint128::zero(),
     };
-
     STATE.save(deps.storage, &state)?;
+
+    let allocation_options = Vec::new();
+    ALLOCATION_OPTIONS.save(deps.storage, &allocation_options)?;
 
     let msg = to_binary(&Snip20Msg::register_receive(env.contract.code_hash))?;
     let message = CosmosMsg::Wasm(WasmMsg::Execute {
@@ -48,7 +50,7 @@ pub fn execute(
     match msg {
         ExecuteMsg::Withdraw {amount} => try_withdraw(deps, env, info, amount),
         ExecuteMsg::SetAllocation {percentages} => try_set_allocation(deps, env, info, percentages),
-        ExecuteMsg::AddAllocationOption{contract, hash} => try_add_allocation_option(deps, env, info, contract, hash),
+        ExecuteMsg::AddAllocationOption{address} => try_add_allocation_option(deps, env, info, address),
         ExecuteMsg::Receive {
             sender,
             from,
@@ -64,21 +66,19 @@ pub fn try_add_allocation_option(
     deps: DepsMut,
     _env: Env,
     _info: MessageInfo,
-    contract: Addr,
-    hash: String,
+    address: Addr,
 ) -> StdResult<Response> {
 
     // load allocation options
     let mut allocation_options = ALLOCATION_OPTIONS.load(deps.storage)?;
     // Check if there is a matching contract in the allocation options
     for allocation_option in &allocation_options {
-        if contract == allocation_option.contract {
+        if address == allocation_option.address {
             return Err(StdError::generic_err("Option already exists"));
         }
     }
     let allocation = Allocation {
-        contract: contract,
-        hash: hash,
+        address: address,
         amount: Uint128::zero(),
     };
     allocation_options.push(allocation);
@@ -93,8 +93,8 @@ pub fn try_withdraw(
     amount: Uint128,
 ) -> StdResult<Response> {
 
-    // check if there is a deposit
-    let already_deposited_option:Option<Uint128> = DEPOSIT_AMOUNTS.get(deps.storage, &info.sender);
+    // Check if there is a deposit
+    let already_deposited_option: Option<Uint128> = DEPOSIT_AMOUNTS.get(deps.storage, &info.sender);
     let new_deposit_amount = match already_deposited_option {
         Some(existing_amount) => {
             if existing_amount < amount {
@@ -104,55 +104,68 @@ pub fn try_withdraw(
         },
         None => return Err(StdError::generic_err("No deposit found")),
     };
+
     let mut state = STATE.load(deps.storage)?;
-    // check if there is an existing allocation and remove it
+    
+    // Check if there is an existing allocation and remove it
     if let Some(individual_allocations) = INDIVIDUAL_ALLOCATIONS.get(deps.storage, &info.sender) {
-        // load allocation options
+        // Load allocation options
         let mut allocation_options = ALLOCATION_OPTIONS.load(deps.storage)?;
-        for old_allocation in individual_allocations {
+        for old_allocation in &individual_allocations {
             // Check if there is a matching contract in the allocation options
             for allocation_option in allocation_options.iter_mut() {
-                if old_allocation.contract == allocation_option.contract {
+                if old_allocation.address == allocation_option.address {
                     allocation_option.amount -= old_allocation.amount;
                     state.total_allocations -= old_allocation.amount;
                 }
             }
         }
-        // set new allocation
+
+        // Set new allocation if there's still some deposit left
         if new_deposit_amount > Uint128::zero() {
             if let Some(percentages) = INDIVIDUAL_PERCENTAGES.get(deps.storage, &info.sender) {
-                let mut completed_percentage = Uint128::zero();
                 let mut new_user_allocations: Vec<Allocation> = Vec::new();
-                for percentage in percentages {
-                    for allocation_option in allocation_options.iter_mut() {
-                        if percentage.contract == allocation_option.contract {
-                            let allocation_amount = new_deposit_amount / Uint128::from(100u32) * percentage.percentage;
-                            allocation_option.amount += allocation_amount;
-                            state.total_allocations += allocation_amount;
-                            completed_percentage += percentage.percentage;
-                            let allocation = Allocation {
-                                contract: allocation_option.contract.clone(),
-                                hash: allocation_option.hash.clone(),
-                                amount: allocation_amount.clone(),
-                            };
-                            new_user_allocations.push(allocation);
+                for percentage in &percentages {
+                    if percentage.percentage > Uint128::zero() {
+                        for allocation_option in allocation_options.iter_mut() {
+                            if percentage.address == allocation_option.address {
+                                let allocation_amount = new_deposit_amount * percentage.percentage / Uint128::from(100u32);
+                                allocation_option.amount += allocation_amount;
+                                state.total_allocations += allocation_amount;
 
+                                let allocation = Allocation {
+                                    address: allocation_option.address.clone(),
+                                    amount: allocation_amount,
+                                };
+                                new_user_allocations.push(allocation);
+                            }
                         }
                     }
                 }
-                // save individual allocation to storage
+
+                // Save the updated individual allocations
                 INDIVIDUAL_ALLOCATIONS.insert(deps.storage, &info.sender, &new_user_allocations)?;
             }
+        } else {
+            // If the new deposit amount is zero, remove the individual allocations and percentages
+            INDIVIDUAL_ALLOCATIONS.remove(deps.storage, &info.sender)?;
+            INDIVIDUAL_PERCENTAGES.remove(deps.storage, &info.sender)?;
         }
+
+        // Save the updated allocation options
+        ALLOCATION_OPTIONS.save(deps.storage, &allocation_options)?;
     }
-    // save to deposit storage
+
+    // Save the new deposit amount to storage
     DEPOSIT_AMOUNTS.insert(deps.storage, &info.sender, &new_deposit_amount)?;
-    // subtract deposit from total deposits in state
+
+    // Subtract the withdrawn amount from total deposits in state
     state.total_deposits -= amount;
     STATE.save(deps.storage, &state)?;
 
+    // Prepare and send the transfer message
     let msg = to_binary(&Snip20Msg::transfer_snip(
-        info.sender,
+        info.sender.clone(),
         amount,
     ))?;
     let message = CosmosMsg::Wasm(WasmMsg::Execute {
@@ -161,10 +174,11 @@ pub fn try_withdraw(
         msg,
         funds: vec![],
     });
-    let response = Response::new()
-    .add_message(message);
+
+    let response = Response::new().add_message(message);
     Ok(response)
 }
+
 
 pub fn try_set_allocation(
     deps: DepsMut,
@@ -186,7 +200,7 @@ pub fn try_set_allocation(
         for old_allocation in individual_allocations {
             // Check if there is a matching contract in the allocation options
             for allocation_option in allocation_options.iter_mut() {
-                if old_allocation.contract == allocation_option.contract {
+                if old_allocation.address == allocation_option.address {
                     allocation_option.amount -= old_allocation.amount;
                     state.total_allocations -= old_allocation.amount;
                 }
@@ -197,19 +211,20 @@ pub fn try_set_allocation(
     let mut completed_percentage = Uint128::zero();
     let mut new_user_allocations: Vec<Allocation> = Vec::new();
     for percentage in &percentages {
-        for allocation_option in allocation_options.iter_mut() {
-            if percentage.contract == allocation_option.contract {
-                let allocation_amount = deposit_amount / Uint128::from(100u32) * percentage.percentage;
-                allocation_option.amount += allocation_amount;
-                state.total_allocations += allocation_amount;
-                completed_percentage += percentage.percentage;
-                let allocation = Allocation {
-                    contract: allocation_option.contract.clone(),
-                    hash: allocation_option.hash.clone(),
-                    amount: allocation_amount.clone(),
-                };
-                new_user_allocations.push(allocation);
+        if percentage.percentage > Uint128::zero() {
+            for allocation_option in allocation_options.iter_mut() {
+                if percentage.address == allocation_option.address {
+                    let allocation_amount = deposit_amount * percentage.percentage /  Uint128::from(100u32);
+                    allocation_option.amount += allocation_amount;
+                    state.total_allocations += allocation_amount;
+                    completed_percentage += percentage.percentage;
+                    let allocation = Allocation {
+                        address: allocation_option.address.clone(),
+                        amount: allocation_amount.clone(),
+                    };
+                    new_user_allocations.push(allocation);
 
+                }
             }
         }
     }
@@ -255,55 +270,72 @@ pub fn try_deposit(
     amount: Uint128,
 ) -> StdResult<Response> {
     // check if there is already a deposit under address
-    let already_deposited_option:Option<Uint128> = DEPOSIT_AMOUNTS.get(deps.storage, &from);
-    let new_deposit_amount = match already_deposited_option {
-        Some(existing_amount) => existing_amount + amount,  // Add the new amount to the existing amount
-        None => amount,  // If no existing amount, use the new amount directly
-    };
-    // load allocation options
-    let mut allocation_options = ALLOCATION_OPTIONS.load(deps.storage)?;
+    let already_deposited_option: Option<Uint128> = DEPOSIT_AMOUNTS.get(deps.storage, &from);
     let mut state = STATE.load(deps.storage)?;
-    // check if there is an existing allocation and remove it
-    if let Some(individual_allocations) = INDIVIDUAL_ALLOCATIONS.get(deps.storage, &from) {
-        for old_allocation in individual_allocations {
-            // Check if there is a matching contract in the allocation options
-            for allocation_option in allocation_options.iter_mut() {
-                if old_allocation.contract == allocation_option.contract {
-                    allocation_option.amount -= old_allocation.amount;
-                    state.total_allocations -= old_allocation.amount;
-                }
-            }
-        }
-        // set new allocation
-        if let Some(percentages) = INDIVIDUAL_PERCENTAGES.get(deps.storage, &from) {
-            let mut completed_percentage = Uint128::zero();
-            let mut new_user_allocations: Vec<Allocation> = Vec::new();
-            for percentage in percentages {
-                for allocation_option in allocation_options.iter_mut() {
-                    if percentage.contract == allocation_option.contract {
-                        let allocation_amount = new_deposit_amount / Uint128::from(100u32) * percentage.percentage;
-                        allocation_option.amount += allocation_amount;
-                        state.total_allocations += allocation_amount;
-                        completed_percentage += percentage.percentage;
-                        let allocation = Allocation {
-                            contract: allocation_option.contract.clone(),
-                            hash: allocation_option.hash.clone(),
-                            amount: allocation_amount.clone(),
-                        };
-                        new_user_allocations.push(allocation);
 
+    match already_deposited_option {
+        Some(existing_amount) => {
+            // Calculate the new total deposit amount
+            let new_deposit_amount = existing_amount + amount;
+
+            // Fetch the existing allocations for this user
+            if let Some(individual_allocations) = INDIVIDUAL_ALLOCATIONS.get(deps.storage, &from) {
+                // Subtract the old allocations from the allocation options and state
+                let mut allocation_options = ALLOCATION_OPTIONS.load(deps.storage)?;
+                for allocation in &individual_allocations {
+                    for allocation_option in allocation_options.iter_mut() {
+                        if allocation.address == allocation_option.address {
+                            allocation_option.amount -= allocation.amount;
+                            state.total_allocations -= allocation.amount;
+                        }
                     }
                 }
+
+                // Calculate new allocations based on the new deposit amount
+                let percentages = INDIVIDUAL_PERCENTAGES.get(deps.storage, &from)
+                    .ok_or_else(|| StdError::generic_err("No percentages found for the deposit"))?;
+                
+                let mut new_allocations: Vec<Allocation> = Vec::new();
+                for percentage in &percentages {
+                    if percentage.percentage > Uint128::zero() {
+                        for allocation_option in allocation_options.iter_mut() {
+                            if percentage.address == allocation_option.address {
+                                let allocation_amount = new_deposit_amount * percentage.percentage / Uint128::from(100u32);
+                                allocation_option.amount += allocation_amount;
+                                state.total_allocations += allocation_amount;
+
+                                let allocation = Allocation {
+                                    address: allocation_option.address.clone(),
+                                    amount: allocation_amount,
+                                };
+                                new_allocations.push(allocation);
+                            }
+                        }
+                    }
+                }
+
+                // Save the updated individual allocations
+                INDIVIDUAL_ALLOCATIONS.insert(deps.storage, &from, &new_allocations)?;
+
+                // Save the updated allocation options
+                ALLOCATION_OPTIONS.save(deps.storage, &allocation_options)?;
             }
-            // save individual allocation to storage
-            INDIVIDUAL_ALLOCATIONS.insert(deps.storage, &from, &new_user_allocations)?;
+
+            // Update the deposit amount in storage
+            DEPOSIT_AMOUNTS.insert(deps.storage, &from, &new_deposit_amount)?;
+
+            // Update the total deposits in state
+            state.total_deposits += amount;
+            STATE.save(deps.storage, &state)?;
         }
-    }
-    // save to deposit storage
-    DEPOSIT_AMOUNTS.insert(deps.storage, &from, &new_deposit_amount)?;
-    // add deposit to total deposits in state
-    state.total_deposits += amount;
-    STATE.save(deps.storage, &state)?;
+        None => {
+            // If no existing amount, use the new amount directly
+            DEPOSIT_AMOUNTS.insert(deps.storage, &from, &amount)?;
+            state.total_deposits += amount;
+            STATE.save(deps.storage, &state)?;
+        }
+    };
+
     Ok(Response::default())
 }
 
@@ -312,6 +344,7 @@ pub fn try_deposit(
 pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
         QueryMsg::GetState {} => to_binary(&query_state(deps)?),
+        QueryMsg::GetAllocationOptions {} => to_binary(&query_allocation_options(deps)?),
         QueryMsg::GetAllocation{address} => to_binary(&query_allocation(deps, address)?),
     }
 }
@@ -319,6 +352,11 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
 fn query_state(deps: Deps) -> StdResult<StateResponse> {
     let state = STATE.load(deps.storage)?;
     Ok(StateResponse { state: state })
+}
+
+fn query_allocation_options(deps: Deps) -> StdResult<AllocationOptionResponse> {
+    let allocations = ALLOCATION_OPTIONS.load(deps.storage)?;
+    Ok(AllocationOptionResponse { allocations: allocations })
 }
 
 fn query_allocation(deps: Deps, address: Addr,) -> StdResult<AllocationResponse> {

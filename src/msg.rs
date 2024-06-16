@@ -29,6 +29,7 @@ pub enum ExecuteMsg {
     AddAllocationOption {
         address: Addr,
     },
+    Faucet {},
     Receive {
         sender: Addr,
         from: Addr,
@@ -50,6 +51,7 @@ pub enum QueryMsg {
     GetState {},
     GetAllocation {address: Addr},
     GetAllocationOptions {},
+    GetStake {address: Addr},
 }
 // We define a custom struct for each query response
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
@@ -68,6 +70,11 @@ pub struct AllocationResponse {
     pub allocations: Vec<Allocation>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct StakeResponse {
+    pub amount: Uint128,
+}
+
 // Messages sent to SNIP-20 contracts
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -80,6 +87,10 @@ pub enum Snip20Msg {
         recipient: Addr,
         amount: Uint128,
         padding: Option<String>,
+    },
+    Mint {
+        recipient: Addr,
+        amount: Uint128,
     },
 }
 
@@ -95,6 +106,12 @@ impl Snip20Msg {
             recipient,
             amount,
             padding: None, // TODO add padding calculation
+        }
+    }
+    pub fn mint_msg(recipient: Addr, amount: Uint128) -> Self {
+        Snip20Msg::Mint {
+            recipient,
+            amount,
         }
     }
 }

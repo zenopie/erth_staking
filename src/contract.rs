@@ -4,7 +4,7 @@ use cosmwasm_std::{
     WasmMsg,
 };
 
-use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg, StateResponse, Snip20Msg,
+use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg, StateResponse, Snip20Msg, StakeResponse,
     ReceiveMsg, AllocationPercentage, AllocationResponse, AllocationOptionResponse,
 };
 use crate::state::{STATE, State, DEPOSIT_AMOUNTS, ALLOCATION_OPTIONS, INDIVIDUAL_ALLOCATIONS, 
@@ -51,6 +51,7 @@ pub fn execute(
         ExecuteMsg::Withdraw {amount} => try_withdraw(deps, env, info, amount),
         ExecuteMsg::SetAllocation {percentages} => try_set_allocation(deps, env, info, percentages),
         ExecuteMsg::AddAllocationOption{address} => try_add_allocation_option(deps, env, info, address),
+        ExecuteMsg::Faucet{} => try_faucet(deps, env, info),
         ExecuteMsg::Receive {
             sender,
             from,
@@ -106,7 +107,6 @@ pub fn try_withdraw(
     };
 
     let mut state = STATE.load(deps.storage)?;
-    
     // Check if there is an existing allocation and remove it
     if let Some(individual_allocations) = INDIVIDUAL_ALLOCATIONS.get(deps.storage, &info.sender) {
         // Load allocation options
@@ -151,11 +151,12 @@ pub fn try_withdraw(
             INDIVIDUAL_ALLOCATIONS.remove(deps.storage, &info.sender)?;
             INDIVIDUAL_PERCENTAGES.remove(deps.storage, &info.sender)?;
         }
-
         // Save the updated allocation options
         ALLOCATION_OPTIONS.save(deps.storage, &allocation_options)?;
     }
 
+
+    
     // Save the new deposit amount to storage
     DEPOSIT_AMOUNTS.insert(deps.storage, &info.sender, &new_deposit_amount)?;
 
@@ -240,6 +241,29 @@ pub fn try_set_allocation(
     Ok(Response::default())
 }
 
+pub fn try_faucet(
+    deps: DepsMut,
+    _env: Env,
+    info: MessageInfo,
+) -> StdResult<Response> {
+
+    let state = STATE.load(deps.storage)?;
+     // Create the contract execution message
+    let msg = to_binary(&Snip20Msg::mint_msg(
+        info.sender.clone(),
+        Uint128::from(1000000u32),
+    ))?;
+    let execute_msg = CosmosMsg::Wasm(WasmMsg::Execute {
+        contract_addr: state.erth_contract.to_string(),
+        code_hash: state.erth_hash.to_string(),
+        funds: vec![],
+        msg: msg,
+    });
+    // Return the execution message in the Response
+    let response = Response::new()
+    .add_message(execute_msg);
+    Ok(response)
+}
 
 pub fn try_receive(
     deps: DepsMut,
@@ -346,6 +370,7 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
         QueryMsg::GetState {} => to_binary(&query_state(deps)?),
         QueryMsg::GetAllocationOptions {} => to_binary(&query_allocation_options(deps)?),
         QueryMsg::GetAllocation{address} => to_binary(&query_allocation(deps, address)?),
+        QueryMsg::GetStake{address} => to_binary(&query_stake(deps, address)?),
     }
 }
 
@@ -373,5 +398,18 @@ fn query_allocation(deps: Deps, address: Addr,) -> StdResult<AllocationResponse>
     Ok(AllocationResponse { 
         percentages: individual_percentages,
         allocations: individual_allocations,
+     })
+}
+
+fn query_stake(deps: Deps, address: Addr,) -> StdResult<StakeResponse> {
+
+// Check if there is a deposit under the address
+let deposit = DEPOSIT_AMOUNTS
+    .get(deps.storage, &address)
+    .unwrap_or_else(|| Uint128::zero());
+
+
+    Ok(StakeResponse { 
+        amount: deposit,
      })
 }

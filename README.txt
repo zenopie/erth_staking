@@ -1,73 +1,47 @@
-zoo-contract Repository
-Introduction
-This repository contains the implementation of the zoo-contract, which leverages the VRF (Verifiable Random Function) code and has integration with Akash.
 
+## Secret Network Smart Contract for Fund Distribution by Voting Weight
 
+### User Focused Summary
 
+Welcome to the Secret Network Smart Contract repository for fund distribution by voting weight! This smart contract allows users to stake their ERTH tokens and participate in the allocation of funds based on a weighted voting system. Here's a quick overview of what it does:
 
-VRF Code Documentation
-The zoo-contract repository uses the VRF (Verifiable Random Function) for [specific functionality]. Here's an overview and detailed documentation:
+1. **Stake ERTH Tokens**: Stake your ERTH tokens to gain voting power.
+2. **Allocate Funds**: Enter your preferred fund allocation percentages, which must total 100%.
+3. **Consensus Mechanism**: Your allocation preferences are averaged with those of other stakers to reach a consensus on fund distribution.
+4. **Real-time Updates**: See your preferred split and the weighted average of all stakers’ allocations, updated in real-time as staking amounts change.
 
-Overview
-Secret VRF allows the games to access Random numbers to be verifiably fair.
+By participating in this system, you help ensure that funds are distributed effectively and fairly, rewarding efficient public goods institutions and moving away from ineffective ones.
 
-How it Works
+### Investor Pitch
 
-Variable Declarations and Value Assignments:
+**Problem Statement**:
+Current monopolies over public goods funding often lead to misaligned incentives, creating institutions that can be ineffective and exploitative. Constituents suffer as their needs are not adequately met, and public goods remain suboptimal.
 
-let random_binary = env.block.random.clone(); // secret VRF
-This line is cloning a random value from the env.block.random. this value is derived from a "secret VRF", which stands for "Verifiable Random Function". A VRF produces a random value in a way that can be verified by others, ensuring the randomness was not manipulated.
+**Solution**:
+Our smart contract introduces free-market values and direct democracy into public goods funding. By enabling granular, decentralized decision-making, we reward effective institutions and transition away from ineffective ones. This system reduces harm and offers alternative governance models, minimizing the risk of corruption and misalignment.
 
-Byte Extraction:
+**Product Market Fit**:
+This governance implementation fits in markets where public goods funding is critical, such as community projects, non-profits, and decentralized autonomous organizations (DAOs). It empowers stakeholders by giving them direct control over fund allocation, ensuring their interests are represented and leading to more effective and accountable public goods institutions.
 
-let random_bytes = &random_binary.as_ref().unwrap().0; // as bytes
-Here, the code is converting the random_binary value into a byte slice. Here's a step-by-step explanation:
+### Development Deepdive
 
-.as_ref(): Converts the Option or Result to a reference. This is useful for manipulating the underlying data without taking ownership.
+**Build Process**:
+The smart contract was developed on the Secret Network, leveraging its privacy-preserving features to ensure secure and confidential voting. The core components include staking functions, allocation input handling, and consensus calculation.
 
-.unwrap(): This method assumes that the Option or Result contains a value (Some or Ok). If it doesn't (i.e., if it's a None or Err), the program will panic at runtime.
+**Contract/Function Interactions**:
+1. **Staking Function**: Users stake their ERTH tokens, which grants them voting power proportional to their staked amount.
+2. **Allocation Input**: Users enter their preferred fund allocation percentages, which are stored securely.
+3. **Consensus Calculation**: The contract calculates the weighted average of all stakers’ allocations to determine the final fund distribution. This ensures that each staker's vote is proportionate to their stake.
 
-.0: The notation suggests that random_binary.as_ref().unwrap() yields a tuple, and .0 accesses its first element.
+**Design Choices**:
+- **Privacy-Preserving**: Built on the Secret Network to ensure that individual votes and preferences remain confidential.
+- **Real-time Adjustments**: The staking function is integrated to adjust voting weights dynamically as staking amounts change, ensuring up-to-date consensus.
+- **Granular Control**: Allows for detailed and precise allocation preferences, promoting effective fund distribution.
 
-Byte Combination:
+### Usage Instructions
 
+1. **Get Testnet ERTH and Viewing Key**: To use the demo, acquire testnet ERTH and a viewing key from the Stake ERTH page. Ensure you have staked your ERTH tokens.
+2. **Enter Allocation Preferences**: Navigate to the allocation page (Governance tab, Deflation Fund) and enter your preferred split in percentages. The total must equal 100%.
+3. **View Results**: After reloading the page, you will see your preferred split and the weighted average of all stakers who declared an allocation.
 
-let random_number = u32::from_le_bytes([
-    random_bytes[0],
-    random_bytes[1],
-    random_bytes[2],
-    random_bytes[3],
-]);
-Here, the code takes the first four bytes of the random_bytes slice and converts them into a single u32 (32-bit unsigned integer) value.
-
-u32::from_le_bytes(): This method reads a byte array of length 4 and interprets it as a u32 value in little-endian order. This means that random_bytes[0] is the least significant byte, and random_bytes[3] is the most significant byte.
-
-Limiting the Range:
-
-
-let spin = random_number % LENGTH; // set max number for random number
-In this step, the random number's range is limited to fit within the range of 0 to LENGTH - 1. This is achieved using the modulo operator (%). For example, if LENGTH is 10, spin will have a value between 0 and 9 inclusive.
-
-To summarize, the code obtains a random byte slice from a verifiable source, extracts the first four bytes, combines them into a single u32 integer, then limits its range to fit between 0 and LENGTH - 1 inclusive.
-
-Akash Integration
-This section documents how zoo-contract integrates with Akash.
-
-Why Akash?
-Akash is a censorship resistant cloud computing platform with low fees.
-
-Deploying a Containerized Frontend on a Generic Cloud Platform:
-1. Prerequisites:
-Docker Installed: Ensure you have Docker on your development machine to containerize your frontend.
-Cloud Platform Account: Sign up or log in to your Cloudmos account
-
-2. Containerize Your Frontend:
-Navigate to your frontend project directory.
-Create a Dockerfile that specifies how your frontend should be containerized.
-Build your Docker image using the Docker CLI.
-Push your Docker image to a container registry.
-
-3. Deploy on Cloudmos:
-Log in to your cloud provider's dashboard through a web browser.
-Adjust settings like scaling, environment variables, network configuration, etc., as needed.
-Start the deployment.
+This project aims to revolutionize public goods funding by leveraging decentralized governance and secure, transparent smart contracts. Join us in creating a fairer, more efficient system for all!

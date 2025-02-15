@@ -1,43 +1,54 @@
+// src/contract.rs
+
 use cosmwasm_std::{
-    entry_point, to_binary, from_binary, Binary, Deps, DepsMut, Env,
-    MessageInfo, Response, StdError, StdResult, Addr, Uint128, CosmosMsg,
-    WasmMsg,
+    entry_point, from_binary, to_binary, Addr, Binary, CosmosMsg, Deps, DepsMut, Env, MessageInfo,
+    Response, StdError, StdResult, Timestamp, Uint128, WasmMsg,
 };
+use secret_toolkit::snip20;
 
-use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg, StateResponse, Snip20Msg, StakeResponse,
-    ReceiveMsg, AllocationPercentage, AllocationResponse, AllocationOptionResponse,
+use crate::msg::{
+    ExecuteMsg, InstantiateMsg, MigrateMsg, QueryMsg, ReceiveMsg, SendMsg, StateResponse,
+    UserInfoResponse, AllocationOptionResponse,
 };
-use crate::state::{STATE, State, DEPOSIT_AMOUNTS, ALLOCATION_OPTIONS, INDIVIDUAL_ALLOCATIONS, 
-    Allocation, INDIVIDUAL_PERCENTAGES,
+use crate::state::{
+    Allocation, AllocationPercentage,
+    ALLOCATION_OPTIONS, STATE, State, UnbondingEntry, USER_INFO, UNBONDING_INFO, UserAllocation,
+    UserInfo,
 };
-
 
 #[entry_point]
 pub fn instantiate(
     deps: DepsMut,
     env: Env,
-    _info: MessageInfo,
+    info: MessageInfo,
     msg: InstantiateMsg,
 ) -> Result<Response, StdError> {
     let state = State {
-        erth_contract: msg.erth_contract,
-        erth_hash: msg.erth_hash,
-        total_deposits: Uint128::zero(),
+        contract_manager: info.sender,
+        erth_token_contract: msg.erth_contract,
+        erth_token_hash: msg.erth_hash,
+        total_staked: Uint128::zero(),
         total_allocations: Uint128::zero(),
+        allocation_counter: 0,
     };
     STATE.save(deps.storage, &state)?;
 
     let allocation_options = Vec::new();
     ALLOCATION_OPTIONS.save(deps.storage, &allocation_options)?;
 
-    let msg = to_binary(&Snip20Msg::register_receive(env.contract.code_hash))?;
+    // Register the contract as a receiver for the ERTH token
     let message = CosmosMsg::Wasm(WasmMsg::Execute {
-        contract_addr: state.erth_contract.into_string(),
-        code_hash: state.erth_hash,
-        msg,
+        contract_addr: state.erth_token_contract.to_string(),
+        code_hash: state.erth_token_hash.clone(),
+        msg: to_binary(&snip20::HandleMsg::RegisterReceive {
+            code_hash: env.contract.code_hash.clone(),
+            padding: None,
+        })?,
         funds: vec![],
     });
-    Ok(Response::new().add_message(message))
+    Ok(Response::new()
+        .add_message(message)
+        .add_attribute("action", "instantiate"))
 }
 
 #[entry_point]
@@ -48,221 +59,503 @@ pub fn execute(
     msg: ExecuteMsg,
 ) -> Result<Response, StdError> {
     match msg {
-        ExecuteMsg::Withdraw {amount} => try_withdraw(deps, env, info, amount),
-        ExecuteMsg::SetAllocation {percentages} => try_set_allocation(deps, env, info, percentages),
-        ExecuteMsg::AddAllocationOption{address} => try_add_allocation_option(deps, env, info, address),
-        ExecuteMsg::Faucet{} => try_faucet(deps, env, info),
+        ExecuteMsg::Withdraw { amount } => execute_withdraw(deps, env, info, amount),
+        ExecuteMsg::Claim {} => execute_claim_staking_rewards(deps, env, info),
+        ExecuteMsg::SetAllocation { percentages } => {
+            execute_set_allocation(deps, env, info, percentages)
+        }
+        ExecuteMsg::ClaimAllocation { allocation_id } => {
+            execute_claim_allocation(deps, env, info, allocation_id)
+        }
+        ExecuteMsg::EditAllocation {
+            allocation_id,
+            key,
+            value,
+        } => execute_edit_allocation(deps, info, allocation_id, key, value),
+        ExecuteMsg::AddAllocation {
+            recieve_addr,
+            recieve_hash,
+            manager_addr,
+            claimer_addr,
+            use_send,
+        } => execute_add_allocation(
+            deps,
+            env,
+            info,
+            recieve_addr,
+            recieve_hash,
+            manager_addr,
+            claimer_addr,
+            use_send,
+        ),
         ExecuteMsg::Receive {
             sender,
             from,
             amount,
             msg,
             memo: _,
-        } => try_receive(deps, env, info, sender, from, amount, msg),  
+        } => try_receive(deps, env, info, sender, from, amount, msg),
+        ExecuteMsg::ClaimUnbonded {} => execute_claim_unbonded(deps, env, info),
     }
 }
 
-
-pub fn try_add_allocation_option(
+fn execute_edit_allocation(
     deps: DepsMut,
-    _env: Env,
-    _info: MessageInfo,
-    address: Addr,
+    info: MessageInfo,
+    allocation_id: u32,
+    key: String,
+    value: Option<String>,
 ) -> StdResult<Response> {
+    // Load the current state
+    let state = STATE.load(deps.storage)?;
 
-    // load allocation options
-    let mut allocation_options = ALLOCATION_OPTIONS.load(deps.storage)?;
-    // Check if there is a matching contract in the allocation options
-    for allocation_option in &allocation_options {
-        if address == allocation_option.address {
-            return Err(StdError::generic_err("Option already exists"));
+    // Load allocation options from storage
+    let mut allocations = ALLOCATION_OPTIONS.load(deps.storage)?;
+
+    // Find the allocation by ID
+    let allocation = allocations
+        .iter_mut()
+        .find(|alloc| alloc.allocation_id == allocation_id)
+        .ok_or_else(|| StdError::generic_err("Allocation not found"))?;
+
+    // Check if the sender is authorized to edit the allocation
+    if info.sender != state.contract_manager {
+        if let Some(manager_addr) = &allocation.manager_addr {
+            if &info.sender != manager_addr {
+                return Err(StdError::generic_err(
+                    "Unauthorized: Only the allocation manager or contract manager can edit this allocation",
+                ));
+            }
+        } else {
+            return Err(StdError::generic_err(
+                "Unauthorized: Only the contract manager can edit this allocation",
+            ));
         }
     }
-    let allocation = Allocation {
-        address: address,
-        amount: Uint128::zero(),
+
+    // Match the key to determine which field to update
+    match key.as_str() {
+        "recieve_addr" => {
+            if let Some(value) = value {
+                let new_addr = deps.api.addr_validate(&value)?;
+                allocation.recieve_addr = new_addr;
+            } else {
+                return Err(StdError::generic_err("recieve_addr cannot be None"));
+            }
+        }
+        "recieve_hash" => {
+            allocation.recieve_hash = value;
+        }
+        "manager_addr" => {
+            allocation.manager_addr = if let Some(value) = value {
+                Some(deps.api.addr_validate(&value)?)
+            } else {
+                None
+            };
+        }
+        "claimer_addr" => {
+            allocation.claimer_addr = if let Some(value) = value {
+                Some(deps.api.addr_validate(&value)?)
+            } else {
+                None
+            };
+        }
+        "use_send" => {
+            if let Some(value) = value {
+                let new_use_send = value
+                    .parse::<bool>()
+                    .map_err(|_| StdError::generic_err("Invalid value for use_send"))?;
+                allocation.use_send = new_use_send;
+            } else {
+                return Err(StdError::generic_err("use_send cannot be None"));
+            }
+        }
+        _ => {
+            return Err(StdError::generic_err(
+                "Invalid key for allocation update",
+            ));
+        }
+    }
+
+    // Save the updated allocation options back to storage
+    ALLOCATION_OPTIONS.save(deps.storage, &allocations)?;
+
+    Ok(Response::new()
+        .add_attribute("action", "edit_allocation")
+        .add_attribute("allocation_id", allocation_id.to_string())
+        .add_attribute("updated_field", key))
+}
+
+pub fn execute_claim_allocation(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    allocation_id: u32,
+) -> StdResult<Response> {
+    // Constants for rewards
+    let reward_rate_per_second: Uint128 = Uint128::from(1_000_000u128); // 1,000,000 ERTH per second
+
+    // Load the current state
+    let state = STATE.load(deps.storage)?;
+
+    // Find the allocation by ID
+    let mut allocation_options = ALLOCATION_OPTIONS.load(deps.storage)?;
+    let allocation = allocation_options
+        .iter_mut()
+        .find(|alloc| alloc.allocation_id == allocation_id)
+        .ok_or_else(|| StdError::generic_err("Allocation not found"))?;
+
+    // If there's a claimer address, check that the info.sender is the claimer
+    if let Some(claimer_addr) = &allocation.claimer_addr {
+        if &info.sender != claimer_addr {
+            return Err(StdError::generic_err(
+                "Unauthorized: Only the claimer can claim this allocation",
+            ));
+        }
+    }
+
+    // Calculate the time elapsed since the last claim
+    let time_elapsed = env.block.time.seconds() - allocation.last_claim.seconds();
+
+    // Calculate the allocation's share of rewards
+    let allocation_share = allocation.amount_allocated
+        * reward_rate_per_second
+        * Uint128::from(time_elapsed)
+        / state.total_allocations;
+
+    let mut messages = Vec::new();
+
+    // Prepare the minting message based on the `use_send` flag
+    if allocation.use_send {
+        // Mint to the staking contract and trigger the receive function
+        let mint_msg = snip20::HandleMsg::Mint {
+            recipient: env.contract.address.to_string(),
+            amount: allocation_share,
+            padding: None,
+            memo: None,
+        };
+        messages.push(CosmosMsg::Wasm(WasmMsg::Execute {
+            contract_addr: state.erth_token_contract.to_string(),
+            code_hash: state.erth_token_hash.clone(),
+            msg: to_binary(&mint_msg)?,
+            funds: vec![],
+        }));
+
+        let send_msg = if let Some(recieve_hash) = &allocation.recieve_hash {
+            snip20::HandleMsg::Send {
+                recipient: allocation.recieve_addr.to_string(),
+                recipient_code_hash: Some(recieve_hash.clone()),
+                amount: allocation_share,
+                msg: Some(to_binary(&SendMsg::AllocationSend { allocation_id })?),
+                padding: None,
+                memo: None,
+            }
+        } else {
+            return Err(StdError::generic_err(
+                "Missing recipient code hash for allocation",
+            ));
+        };
+
+        messages.push(CosmosMsg::Wasm(WasmMsg::Execute {
+            contract_addr: state.erth_token_contract.to_string(),
+            code_hash: state.erth_token_hash.clone(),
+            msg: to_binary(&send_msg)?,
+            funds: vec![],
+        }));
+    } else {
+        // Mint directly to the allocation receiver address
+        let mint_msg = snip20::HandleMsg::Mint {
+            recipient: allocation.recieve_addr.to_string(),
+            amount: allocation_share,
+            padding: None,
+            memo: None,
+        };
+        messages.push(CosmosMsg::Wasm(WasmMsg::Execute {
+            contract_addr: state.erth_token_contract.to_string(),
+            code_hash: state.erth_token_hash.clone(),
+            msg: to_binary(&mint_msg)?,
+            funds: vec![],
+        }));
     };
-    allocation_options.push(allocation);
+
+    // Update the claim time
+    allocation.last_claim = env.block.time;
     ALLOCATION_OPTIONS.save(deps.storage, &allocation_options)?;
+
+    // Return the response with the mint message
+    Ok(Response::new()
+        .add_messages(messages)
+        .add_attribute("action", "claim_allocation")
+        .add_attribute("allocation_id", allocation_id.to_string())
+        .add_attribute("allocation_share", allocation_share.to_string()))
+}
+
+pub fn execute_add_allocation(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    recieve_addr: Addr,
+    recieve_hash: Option<String>,
+    manager_addr: Option<Addr>,
+    claimer_addr: Option<Addr>,
+    use_send: bool,
+) -> StdResult<Response> {
+    // Load the current state
+    let mut state = STATE.load(deps.storage)?;
+
+    // Check if the sender is the contract manager
+    if info.sender != state.contract_manager {
+        return Err(StdError::generic_err(
+            "Unauthorized: Only the contract manager can add an allocation",
+        ));
+    }
+
+    // Load allocation options
+    let mut allocation_options = ALLOCATION_OPTIONS.load(deps.storage)?;
+
+    state.allocation_counter += 1;
+
+    // Create a new allocation
+    let allocation = Allocation {
+        allocation_id: state.allocation_counter,
+        recieve_addr,
+        recieve_hash,
+        manager_addr,
+        claimer_addr,
+        use_send,
+        amount_allocated: Uint128::zero(),
+        last_claim: env.block.time,
+    };
+
+    // Add the new allocation to the list
+    allocation_options.push(allocation);
+
+    // Save the updated allocation options and state
+    ALLOCATION_OPTIONS.save(deps.storage, &allocation_options)?;
+    STATE.save(deps.storage, &state)?;
+
     Ok(Response::default())
 }
 
-pub fn try_withdraw(
+pub fn execute_withdraw(
     deps: DepsMut,
-    _env: Env,
+    env: Env,
     info: MessageInfo,
     amount: Uint128,
 ) -> StdResult<Response> {
+    // Load user info or return an error if no deposit is found
+    let mut user_info: UserInfo = USER_INFO
+        .get(deps.storage, &info.sender)
+        .ok_or_else(|| StdError::generic_err("No deposit found"))?;
 
-    // Check if there is a deposit
-    let already_deposited_option: Option<Uint128> = DEPOSIT_AMOUNTS.get(deps.storage, &info.sender);
-    let new_deposit_amount = match already_deposited_option {
-        Some(existing_amount) => {
-            if existing_amount < amount {
-                return Err(StdError::generic_err("Insufficient funds"));
-            }
-            existing_amount - amount // Subtract the amount
-        },
-        None => return Err(StdError::generic_err("No deposit found")),
-    };
-
-    let mut state = STATE.load(deps.storage)?;
-    // Check if there is an existing allocation and remove it
-    if let Some(individual_allocations) = INDIVIDUAL_ALLOCATIONS.get(deps.storage, &info.sender) {
-        // Load allocation options
-        let mut allocation_options = ALLOCATION_OPTIONS.load(deps.storage)?;
-        for old_allocation in &individual_allocations {
-            // Check if there is a matching contract in the allocation options
-            for allocation_option in allocation_options.iter_mut() {
-                if old_allocation.address == allocation_option.address {
-                    allocation_option.amount -= old_allocation.amount;
-                    state.total_allocations -= old_allocation.amount;
-                }
-            }
-        }
-
-        // Set new allocation if there's still some deposit left
-        if new_deposit_amount > Uint128::zero() {
-            if let Some(percentages) = INDIVIDUAL_PERCENTAGES.get(deps.storage, &info.sender) {
-                let mut new_user_allocations: Vec<Allocation> = Vec::new();
-                for percentage in &percentages {
-                    if percentage.percentage > Uint128::zero() {
-                        for allocation_option in allocation_options.iter_mut() {
-                            if percentage.address == allocation_option.address {
-                                let allocation_amount = new_deposit_amount * percentage.percentage / Uint128::from(100u32);
-                                allocation_option.amount += allocation_amount;
-                                state.total_allocations += allocation_amount;
-
-                                let allocation = Allocation {
-                                    address: allocation_option.address.clone(),
-                                    amount: allocation_amount,
-                                };
-                                new_user_allocations.push(allocation);
-                            }
-                        }
-                    }
-                }
-
-                // Save the updated individual allocations
-                INDIVIDUAL_ALLOCATIONS.insert(deps.storage, &info.sender, &new_user_allocations)?;
-            }
-        } else {
-            // If the new deposit amount is zero, remove the individual allocations and percentages
-            INDIVIDUAL_ALLOCATIONS.remove(deps.storage, &info.sender)?;
-            INDIVIDUAL_PERCENTAGES.remove(deps.storage, &info.sender)?;
-        }
-        // Save the updated allocation options
-        ALLOCATION_OPTIONS.save(deps.storage, &allocation_options)?;
+    // Ensure the user has enough funds to withdraw
+    if user_info.staked_amount < amount {
+        return Err(StdError::generic_err("Insufficient funds"));
     }
 
+    // Calculate the new deposit amount after withdrawal
+    let new_deposit_amount = user_info.staked_amount - amount;
 
-    
-    // Save the new deposit amount to storage
-    DEPOSIT_AMOUNTS.insert(deps.storage, &info.sender, &new_deposit_amount)?;
+    // Load allocation options and state
+    let mut allocation_options = ALLOCATION_OPTIONS.load(deps.storage)?;
+    let mut state = STATE.load(deps.storage)?;
 
-    // Subtract the withdrawn amount from total deposits in state
-    state.total_deposits -= amount;
+    // Subtract the old allocations using the helper function
+    subtract_old_allocations(
+        &user_info.allocations,
+        &mut allocation_options,
+        &mut state,
+    );
+
+    if new_deposit_amount > Uint128::zero() {
+        // If there's still a deposit left, recalculate allocations
+        let new_allocations = add_new_allocations(
+            new_deposit_amount,
+            &user_info.percentages,
+            &mut allocation_options,
+            &mut state,
+        )?;
+        user_info.allocations = new_allocations;
+        user_info.staked_amount = new_deposit_amount;
+
+        // Save the updated user info back to storage
+        USER_INFO.insert(deps.storage, &info.sender, &user_info)?;
+    } else {
+        // If the new deposit amount is zero, remove the user's info from storage
+        USER_INFO.remove(deps.storage, &info.sender)?;
+    }
+
+    // Save the updated allocation options and state
+    ALLOCATION_OPTIONS.save(deps.storage, &allocation_options)?;
     STATE.save(deps.storage, &state)?;
 
-    // Prepare and send the transfer message
-    let msg = to_binary(&Snip20Msg::transfer_snip(
-        info.sender.clone(),
+    // Subtract the withdrawn amount from total deposits in state
+    state.total_staked -= amount;
+
+    // Add the unbonding entry to UNBONDING_INFO
+    let unbonding_period = 21 * 24 * 60 * 60; // 21 days in seconds
+    let unbonding_time = Timestamp::from_seconds(env.block.time.seconds() + unbonding_period);
+    let unbonding_entry = UnbondingEntry {
         amount,
-    ))?;
+        unbonding_time,
+    };
+
+    let mut unbonding_entries =
+        UNBONDING_INFO.get(deps.storage, &info.sender).unwrap_or_else(Vec::new);
+    unbonding_entries.push(unbonding_entry);
+    UNBONDING_INFO.insert(deps.storage, &info.sender, &unbonding_entries)?;
+
+    // No tokens are transferred at this time
+
+    Ok(Response::new()
+        .add_attribute("action", "request_withdraw")
+        .add_attribute("amount", amount.to_string())
+        .add_attribute("unbonding_time", unbonding_time.seconds().to_string()))
+}
+
+pub fn execute_claim_unbonded(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+) -> StdResult<Response> {
+    // Load unbonding entries for the user
+    let mut unbonding_entries =
+        UNBONDING_INFO.get(deps.storage, &info.sender).unwrap_or_else(Vec::new);
+
+    // Filter unbonding entries that are ready to be claimed
+    let mut claimable_amount = Uint128::zero();
+    let current_time = env.block.time.seconds();
+    unbonding_entries.retain(|entry| {
+        if entry.unbonding_time.seconds() <= current_time {
+            claimable_amount += entry.amount;
+            false // Remove this entry
+        } else {
+            true // Keep this entry
+        }
+    });
+
+    if claimable_amount == Uint128::zero() {
+        return Err(StdError::generic_err("No tokens available to claim"));
+    }
+
+    // Save the updated unbonding entries back to storage
+    UNBONDING_INFO.insert(deps.storage, &info.sender, &unbonding_entries)?;
+
+    // Prepare and send the transfer message
+    let state = STATE.load(deps.storage)?;
+    let msg = snip20::HandleMsg::Transfer {
+        recipient: info.sender.clone().to_string(),
+        amount: claimable_amount,
+        padding: None,
+        memo: None,
+    };
     let message = CosmosMsg::Wasm(WasmMsg::Execute {
-        contract_addr: state.erth_contract.to_string(),
-        code_hash: state.erth_hash,
-        msg,
+        contract_addr: state.erth_token_contract.to_string(),
+        code_hash: state.erth_token_hash,
+        msg: to_binary(&msg)?,
         funds: vec![],
     });
 
-    let response = Response::new().add_message(message);
-    Ok(response)
+    Ok(Response::new()
+        .add_message(message)
+        .add_attribute("action", "claim_unbonded")
+        .add_attribute("amount", claimable_amount.to_string()))
 }
 
+pub fn execute_claim_staking_rewards(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+) -> StdResult<Response> {
+    // Constants for rewards
+    let reward_rate_per_second: Uint128 = Uint128::from(1_000_000u128); // 1,000,000 ERTH per second
 
-pub fn try_set_allocation(
+    // Load the current state
+    let state = STATE.load(deps.storage)?;
+
+    let mut user_info = USER_INFO
+        .get(deps.storage, &info.sender)
+        .ok_or_else(|| StdError::generic_err("no user info found"))?;
+    let time_elapsed = env.block.time.seconds() - user_info.last_claim.seconds();
+
+    if time_elapsed > 0 {
+        // Calculate the staker's share of rewards
+        let staker_share = user_info.staked_amount
+            * reward_rate_per_second
+            * Uint128::from(time_elapsed)
+            / state.total_staked;
+
+        // Update the last reward time to the current time
+        user_info.last_claim = env.block.time;
+        USER_INFO.insert(deps.storage, &info.sender, &user_info)?;
+
+        // Mint Staking Rewards
+        let msg = snip20::HandleMsg::Mint {
+            recipient: info.sender.clone().to_string(),
+            amount: staker_share,
+            memo: None,
+            padding: None,
+        };
+        let message = CosmosMsg::Wasm(WasmMsg::Execute {
+            contract_addr: state.erth_token_contract.to_string(),
+            code_hash: state.erth_token_hash,
+            msg: to_binary(&msg)?,
+            funds: vec![],
+        });
+
+        // Create a response indicating the rewards have been claimed
+        Ok(Response::new()
+            .add_message(message)
+            .add_attribute("action", "claim_staking_rewards")
+            .add_attribute("staker", info.sender.to_string())
+            .add_attribute("rewards_claimed", staker_share.to_string()))
+    } else {
+        Err(StdError::generic_err("No rewards available to claim"))
+    }
+}
+
+pub fn execute_set_allocation(
     deps: DepsMut,
     _env: Env,
     info: MessageInfo,
     percentages: Vec<AllocationPercentage>,
 ) -> StdResult<Response> {
+    // Load user info or return an error if no deposit is found
+    let mut user_info: UserInfo = USER_INFO
+        .get(deps.storage, &info.sender)
+        .ok_or_else(|| StdError::generic_err("No deposit found"))?;
 
-    // check if there is a deposit
-    let deposit_amount = match DEPOSIT_AMOUNTS.get(deps.storage, &info.sender) {
-        Some(amount) => amount,
-        None => return Err(StdError::generic_err("No deposit found")),
-    };
-    // load allocation options
+    // Load allocation options and state
     let mut allocation_options = ALLOCATION_OPTIONS.load(deps.storage)?;
     let mut state = STATE.load(deps.storage)?;
-    // check if there is an existing allocation and remove it
-    if let Some(individual_allocations) = INDIVIDUAL_ALLOCATIONS.get(deps.storage, &info.sender) {
-        for old_allocation in individual_allocations {
-            // Check if there is a matching contract in the allocation options
-            for allocation_option in allocation_options.iter_mut() {
-                if old_allocation.address == allocation_option.address {
-                    allocation_option.amount -= old_allocation.amount;
-                    state.total_allocations -= old_allocation.amount;
-                }
-            }
-        }
-    }
-    // set new allocation
-    let mut completed_percentage = Uint128::zero();
-    let mut new_user_allocations: Vec<Allocation> = Vec::new();
-    for percentage in &percentages {
-        if percentage.percentage > Uint128::zero() {
-            for allocation_option in allocation_options.iter_mut() {
-                if percentage.address == allocation_option.address {
-                    let allocation_amount = deposit_amount * percentage.percentage /  Uint128::from(100u32);
-                    allocation_option.amount += allocation_amount;
-                    state.total_allocations += allocation_amount;
-                    completed_percentage += percentage.percentage;
-                    let allocation = Allocation {
-                        address: allocation_option.address.clone(),
-                        amount: allocation_amount.clone(),
-                    };
-                    new_user_allocations.push(allocation);
 
-                }
-            }
-        }
-    }
-    if completed_percentage != Uint128::from(100u32) {
-        return Err(StdError::generic_err("percentage error"))
-    }
-    // save individual allocation to storage
-    INDIVIDUAL_ALLOCATIONS.insert(deps.storage, &info.sender, &new_user_allocations)?;
-    INDIVIDUAL_PERCENTAGES.insert(deps.storage, &info.sender, &percentages)?;
-    // save total allocations to storage
+    // Subtract the old allocations using the helper function
+    subtract_old_allocations(
+        &user_info.allocations,
+        &mut allocation_options,
+        &mut state,
+    );
+
+    // Add the new allocations using the helper function
+    let new_allocations = add_new_allocations(
+        user_info.staked_amount,
+        &percentages,
+        &mut allocation_options,
+        &mut state,
+    )?;
+
+    // Update the user's info with the new allocations and percentages
+    user_info.allocations = new_allocations;
+    user_info.percentages = percentages;
+
+    // Save the updated user info back to storage
+    USER_INFO.insert(deps.storage, &info.sender, &user_info)?;
+
+    // Save the updated allocation options and state
     ALLOCATION_OPTIONS.save(deps.storage, &allocation_options)?;
     STATE.save(deps.storage, &state)?;
+
     Ok(Response::default())
-}
-
-pub fn try_faucet(
-    deps: DepsMut,
-    _env: Env,
-    info: MessageInfo,
-) -> StdResult<Response> {
-
-    let state = STATE.load(deps.storage)?;
-     // Create the contract execution message
-    let msg = to_binary(&Snip20Msg::mint_msg(
-        info.sender.clone(),
-        Uint128::from(1000000u32),
-    ))?;
-    let execute_msg = CosmosMsg::Wasm(WasmMsg::Execute {
-        contract_addr: state.erth_contract.to_string(),
-        code_hash: state.erth_hash.to_string(),
-        funds: vec![],
-        msg: msg,
-    });
-    // Return the execution message in the Response
-    let response = Response::new()
-    .add_message(execute_msg);
-    Ok(response)
 }
 
 pub fn try_receive(
@@ -274,142 +567,222 @@ pub fn try_receive(
     amount: Uint128,
     msg: Binary,
 ) -> Result<Response, StdError> {
-
     let msg: ReceiveMsg = from_binary(&msg)?;
 
     let state = STATE.load(deps.storage)?;
-    if info.sender != state.erth_contract {
+    if info.sender != state.erth_token_contract {
         return Err(StdError::generic_err("invalid snip"));
     }
 
     match msg {
-        ReceiveMsg::Deposit {} => try_deposit(deps, env, from, amount),
-    }   
+        ReceiveMsg::StakeErth {} => receive_stake(deps, env, from, amount),
+    }
 }
 
-pub fn try_deposit(
+pub fn receive_stake(
     deps: DepsMut,
-    _env: Env,
+    env: Env,
     from: Addr,
     amount: Uint128,
 ) -> StdResult<Response> {
-    // check if there is already a deposit under address
-    let already_deposited_option: Option<Uint128> = DEPOSIT_AMOUNTS.get(deps.storage, &from);
+    // Load the current state
     let mut state = STATE.load(deps.storage)?;
 
-    match already_deposited_option {
-        Some(existing_amount) => {
+    // Fetch existing user information or initialize it if not present
+    let user_info: UserInfo = match USER_INFO.get(deps.storage, &from) {
+        Some(mut existing_user_info) => {
+            // Load allocation options
+            let mut allocation_options = ALLOCATION_OPTIONS.load(deps.storage)?;
+
+            // Subtract old allocations
+            subtract_old_allocations(
+                &existing_user_info.allocations,
+                &mut allocation_options,
+                &mut state,
+            );
+
             // Calculate the new total deposit amount
-            let new_deposit_amount = existing_amount + amount;
+            existing_user_info.staked_amount += amount;
 
-            // Fetch the existing allocations for this user
-            if let Some(individual_allocations) = INDIVIDUAL_ALLOCATIONS.get(deps.storage, &from) {
-                // Subtract the old allocations from the allocation options and state
-                let mut allocation_options = ALLOCATION_OPTIONS.load(deps.storage)?;
-                for allocation in &individual_allocations {
-                    for allocation_option in allocation_options.iter_mut() {
-                        if allocation.address == allocation_option.address {
-                            allocation_option.amount -= allocation.amount;
-                            state.total_allocations -= allocation.amount;
-                        }
-                    }
-                }
+            // Calculate new allocations using the helper function
+            let new_allocations = add_new_allocations(
+                existing_user_info.staked_amount,
+                &existing_user_info.percentages,
+                &mut allocation_options,
+                &mut state,
+            )?;
 
-                // Calculate new allocations based on the new deposit amount
-                let percentages = INDIVIDUAL_PERCENTAGES.get(deps.storage, &from)
-                    .ok_or_else(|| StdError::generic_err("No percentages found for the deposit"))?;
-                
-                let mut new_allocations: Vec<Allocation> = Vec::new();
-                for percentage in &percentages {
-                    if percentage.percentage > Uint128::zero() {
-                        for allocation_option in allocation_options.iter_mut() {
-                            if percentage.address == allocation_option.address {
-                                let allocation_amount = new_deposit_amount * percentage.percentage / Uint128::from(100u32);
-                                allocation_option.amount += allocation_amount;
-                                state.total_allocations += allocation_amount;
+            // Update the user information with new allocations
+            existing_user_info.allocations = new_allocations;
 
-                                let allocation = Allocation {
-                                    address: allocation_option.address.clone(),
-                                    amount: allocation_amount,
-                                };
-                                new_allocations.push(allocation);
-                            }
-                        }
-                    }
-                }
+            // Save the updated allocation options
+            ALLOCATION_OPTIONS.save(deps.storage, &allocation_options)?;
 
-                // Save the updated individual allocations
-                INDIVIDUAL_ALLOCATIONS.insert(deps.storage, &from, &new_allocations)?;
-
-                // Save the updated allocation options
-                ALLOCATION_OPTIONS.save(deps.storage, &allocation_options)?;
-            }
-
-            // Update the deposit amount in storage
-            DEPOSIT_AMOUNTS.insert(deps.storage, &from, &new_deposit_amount)?;
-
-            // Update the total deposits in state
-            state.total_deposits += amount;
-            STATE.save(deps.storage, &state)?;
+            existing_user_info
         }
         None => {
-            // If no existing amount, use the new amount directly
-            DEPOSIT_AMOUNTS.insert(deps.storage, &from, &amount)?;
-            state.total_deposits += amount;
-            STATE.save(deps.storage, &state)?;
+            // Initialize new user info if not present
+            UserInfo {
+                staked_amount: amount, // Directly set the new deposit amount
+                last_claim: env.block.time,
+                allocations: Vec::new(),
+                percentages: Vec::new(),
+            }
         }
     };
+
+    // Save the updated user information to storage
+    USER_INFO.insert(deps.storage, &from, &user_info)?;
+
+    // Update the total staked amount in state
+    state.total_staked += amount;
+    STATE.save(deps.storage, &state)?;
 
     Ok(Response::default())
 }
 
+#[entry_point]
+pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> StdResult<Response> {
+    match msg {
+        MigrateMsg::Migrate {} => {
+            // Load the current state
+            let state = STATE.load(deps.storage)?;
+
+            // Register the contract as a receiver for the ERTH token
+            let message = CosmosMsg::Wasm(WasmMsg::Execute {
+                contract_addr: state.erth_token_contract.to_string(),
+                code_hash: state.erth_token_hash.clone(),
+                msg: to_binary(&snip20::HandleMsg::RegisterReceive {
+                    code_hash: env.contract.code_hash.clone(),
+                    padding: None,
+                })?,
+                funds: vec![],
+            });
+            Ok(Response::new()
+                .add_message(message)
+                .add_attribute("action", "migrate"))
+        }
+    }
+}
 
 #[entry_point]
-pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
+pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
         QueryMsg::GetState {} => to_binary(&query_state(deps)?),
         QueryMsg::GetAllocationOptions {} => to_binary(&query_allocation_options(deps)?),
-        QueryMsg::GetAllocation{address} => to_binary(&query_allocation(deps, address)?),
-        QueryMsg::GetStake{address} => to_binary(&query_stake(deps, address)?),
+        QueryMsg::GetUserInfo { address } => to_binary(&query_user_info(deps, env, address)?),
     }
 }
 
 fn query_state(deps: Deps) -> StdResult<StateResponse> {
     let state = STATE.load(deps.storage)?;
-    Ok(StateResponse { state: state })
+    Ok(StateResponse { state })
 }
 
 fn query_allocation_options(deps: Deps) -> StdResult<AllocationOptionResponse> {
     let allocations = ALLOCATION_OPTIONS.load(deps.storage)?;
-    Ok(AllocationOptionResponse { allocations: allocations })
+    Ok(AllocationOptionResponse { allocations })
 }
 
-fn query_allocation(deps: Deps, address: Addr,) -> StdResult<AllocationResponse> {
+pub fn query_user_info(deps: Deps, env: Env, address: Addr) -> StdResult<UserInfoResponse> {
+    // Constants for rewards
+    let reward_rate_per_second: Uint128 = Uint128::from(1_000_000u128); // 1,000,000 ERTH per second
 
-    // Check if there is an allocation under the address
-    let individual_percentages = INDIVIDUAL_PERCENTAGES
-    .get(deps.storage, &address)
-    .unwrap_or_else(Vec::new);
+    // Load the current state
+    let state = STATE.load(deps.storage)?;
 
-    let individual_allocations = INDIVIDUAL_ALLOCATIONS
-    .get(deps.storage, &address)
-    .unwrap_or_else(Vec::new);
+    // Load user info or use default if not found
+    let user_info = USER_INFO
+        .get(deps.storage, &address)
+        .unwrap_or(UserInfo {
+            staked_amount: Uint128::zero(),
+            last_claim: env.block.time,
+            allocations: Vec::new(),
+            percentages: Vec::new(),
+        });
 
-    Ok(AllocationResponse { 
-        percentages: individual_percentages,
-        allocations: individual_allocations,
-     })
+    // Calculate the time elapsed since the last claim
+    let time_elapsed = env.block.time.seconds() - user_info.last_claim.seconds();
+
+    // Calculate the staking rewards due
+    let staking_rewards_due = if time_elapsed > 0 {
+        user_info.staked_amount
+            * reward_rate_per_second
+            * Uint128::from(time_elapsed)
+            / state.total_staked
+    } else {
+        Uint128::zero() // No rewards if no time has passed since the last claim
+    };
+
+    // Load unbonding entries
+    let unbonding_entries = UNBONDING_INFO
+        .get(deps.storage, &address)
+        .unwrap_or_else(Vec::new);
+
+    // Prepare the response
+    let user_info_response = UserInfoResponse {
+        user_info,
+        staking_rewards_due,
+        total_staked: state.total_staked,
+        unbonding_entries,
+    };
+
+    Ok(user_info_response)
 }
 
-fn query_stake(deps: Deps, address: Addr,) -> StdResult<StakeResponse> {
+// Helper functions
 
-// Check if there is a deposit under the address
-let deposit = DEPOSIT_AMOUNTS
-    .get(deps.storage, &address)
-    .unwrap_or_else(|| Uint128::zero());
+pub fn subtract_old_allocations(
+    old_allocations: &[UserAllocation],
+    allocation_options: &mut [Allocation],
+    state: &mut State,
+) {
+    for old_allocation in old_allocations {
+        for allocation_option in allocation_options.iter_mut() {
+            if old_allocation.allocation_id == allocation_option.allocation_id {
+                allocation_option.amount_allocated -= old_allocation.amount_allocated;
+                state.total_allocations -= old_allocation.amount_allocated;
+            }
+        }
+    }
+}
 
+pub fn add_new_allocations(
+    deposit_amount: Uint128,
+    percentages: &[AllocationPercentage],
+    allocation_options: &mut [Allocation],
+    state: &mut State,
+) -> StdResult<Vec<UserAllocation>> {
+    let mut new_allocations: Vec<UserAllocation> = Vec::new();
+    let mut total_percentage = Uint128::zero();
 
-    Ok(StakeResponse { 
-        amount: deposit,
-     })
+    for percentage in percentages {
+        if percentage.percentage > Uint128::zero() {
+            for allocation in allocation_options.iter_mut() {
+                // Assuming both AllocationPercentage and Allocation have an `allocation_id` field
+                if percentage.allocation_id == allocation.allocation_id {
+                    let allocation_amount =
+                        deposit_amount * percentage.percentage / Uint128::from(100u32);
+                    allocation.amount_allocated += allocation_amount;
+                    state.total_allocations += allocation_amount;
+                    total_percentage += percentage.percentage;
+
+                    let user_allocation = UserAllocation {
+                        allocation_id: allocation.allocation_id, // Unique ID for this allocation
+                        amount_allocated: allocation_amount,
+                    };
+                    new_allocations.push(user_allocation);
+                }
+            }
+        }
+    }
+
+    // Ensure that the total percentages add up to 100%
+    if total_percentage != Uint128::from(100u32) {
+        return Err(StdError::generic_err(
+            "Percentage error: allocations must sum to 100%",
+        ));
+    }
+
+    Ok(new_allocations)
 }

@@ -46,6 +46,7 @@ pub enum ExecuteMsg {
         msg: Binary,
     },
     ClaimUnbonded {}, // Added new execute message
+    DistributeAllocationRewards {}, // New message for allocation rewards distribution
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]

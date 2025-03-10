@@ -30,6 +30,7 @@ pub fn instantiate(
         total_staked: Uint128::zero(),
         total_allocations: Uint128::zero(),
         allocation_counter: 0,
+        last_upkeep: env.block.time,
     };
     STATE.save(deps.storage, &state)?;
 
@@ -96,6 +97,7 @@ pub fn execute(
             memo: _,
         } => try_receive(deps, env, info, sender, from, amount, msg),
         ExecuteMsg::ClaimUnbonded {} => execute_claim_unbonded(deps, env, info),
+        ExecuteMsg::DistributeAllocationRewards {} => execute_distribute_allocation_rewards(deps, env, info),
     }
 }
 
@@ -192,9 +194,6 @@ pub fn execute_claim_allocation(
     info: MessageInfo,
     allocation_id: u32,
 ) -> StdResult<Response> {
-    // Constants for rewards
-    let reward_rate_per_second: Uint128 = Uint128::from(1_000_000u128); // 1,000,000 ERTH per second
-
     // Load the current state
     let state = STATE.load(deps.storage)?;
 
@@ -214,14 +213,13 @@ pub fn execute_claim_allocation(
         }
     }
 
-    // Calculate the time elapsed since the last claim
-    let time_elapsed = env.block.time.seconds() - allocation.last_claim.seconds();
-
-    // Calculate the allocation's share of rewards
-    let allocation_share = allocation.amount_allocated
-        * reward_rate_per_second
-        * Uint128::from(time_elapsed)
-        / state.total_allocations;
+    // Get the accumulated rewards
+    let rewards_to_claim = allocation.accumulated_rewards;
+    
+    // If no rewards available, return an error
+    if rewards_to_claim.is_zero() {
+        return Err(StdError::generic_err("No rewards available to claim"));
+    }
 
     let mut messages = Vec::new();
 
@@ -230,7 +228,7 @@ pub fn execute_claim_allocation(
         // Mint to the staking contract and trigger the receive function
         let mint_msg = snip20::HandleMsg::Mint {
             recipient: env.contract.address.to_string(),
-            amount: allocation_share,
+            amount: rewards_to_claim,
             padding: None,
             memo: None,
         };
@@ -245,7 +243,7 @@ pub fn execute_claim_allocation(
             snip20::HandleMsg::Send {
                 recipient: allocation.recieve_addr.to_string(),
                 recipient_code_hash: Some(recieve_hash.clone()),
-                amount: allocation_share,
+                amount: rewards_to_claim,
                 msg: Some(to_binary(&SendMsg::AllocationSend { allocation_id })?),
                 padding: None,
                 memo: None,
@@ -266,7 +264,7 @@ pub fn execute_claim_allocation(
         // Mint directly to the allocation receiver address
         let mint_msg = snip20::HandleMsg::Mint {
             recipient: allocation.recieve_addr.to_string(),
-            amount: allocation_share,
+            amount: rewards_to_claim,
             padding: None,
             memo: None,
         };
@@ -278,6 +276,8 @@ pub fn execute_claim_allocation(
         }));
     };
 
+    // Reset the accumulated rewards to zero
+    allocation.accumulated_rewards = Uint128::zero();
     // Update the claim time
     allocation.last_claim = env.block.time;
     ALLOCATION_OPTIONS.save(deps.storage, &allocation_options)?;
@@ -287,7 +287,7 @@ pub fn execute_claim_allocation(
         .add_messages(messages)
         .add_attribute("action", "claim_allocation")
         .add_attribute("allocation_id", allocation_id.to_string())
-        .add_attribute("allocation_share", allocation_share.to_string()))
+        .add_attribute("rewards_claimed", rewards_to_claim.to_string()))
 }
 
 pub fn execute_add_allocation(
@@ -325,6 +325,7 @@ pub fn execute_add_allocation(
         use_send,
         amount_allocated: Uint128::zero(),
         last_claim: env.block.time,
+        accumulated_rewards: Uint128::zero(),
     };
 
     // Add the new allocation to the list
@@ -462,27 +463,138 @@ pub fn execute_claim_unbonded(
         .add_attribute("amount", claimable_amount.to_string()))
 }
 
-pub fn execute_claim_staking_rewards(
-    deps: DepsMut,
+// Add a helper function for distribution
+fn distribute_allocation_rewards(
+    deps: &mut DepsMut,
+    current_time: Timestamp,
+    last_upkeep: Timestamp,
+) -> StdResult<(Uint128, u64, bool)> {
+    // Constants for rewards
+    let reward_rate_per_second: Uint128 = Uint128::from(1_000_000u128); // 1,000,000 ERTH per second (1 ERTH)
+    
+    // Calculate time elapsed since last upkeep
+    let time_elapsed = current_time.seconds() - last_upkeep.seconds();
+    
+    // If no time has elapsed, return early
+    if time_elapsed == 0 {
+        return Ok((Uint128::zero(), 0, false));
+    }
+    
+    // Load allocation options
+    let mut allocation_options = ALLOCATION_OPTIONS.load(deps.storage)?;
+    
+    // If there are no allocations, return early
+    if allocation_options.is_empty() {
+        return Ok((Uint128::zero(), time_elapsed, false));
+    }
+    
+    // Calculate total rewards for the period
+    let total_rewards_for_period = reward_rate_per_second * Uint128::from(time_elapsed);
+    
+    // Calculate total allocation amount from loaded options
+    let calculated_total_allocations: Uint128 = allocation_options
+        .iter()
+        .fold(Uint128::zero(), |acc, allocation| acc + allocation.amount_allocated);
+    
+    // If total is zero, return early
+    if calculated_total_allocations.is_zero() {
+        return Ok((Uint128::zero(), time_elapsed, false));
+    }
+    
+    // Distribute rewards to each allocation based on their proportion of the total
+    for allocation in allocation_options.iter_mut() {
+        // Calculate this allocation's share of rewards
+        let allocation_share = allocation.amount_allocated
+            * total_rewards_for_period
+            / calculated_total_allocations;
+        
+        // Add to accumulated rewards
+        allocation.accumulated_rewards += allocation_share;
+    }
+    
+    // Save the updated allocations
+    ALLOCATION_OPTIONS.save(deps.storage, &allocation_options)?;
+    
+    // Return the total rewards distributed, time elapsed, and success flag
+    Ok((total_rewards_for_period, time_elapsed, true))
+}
+
+// Update the execute_distribute_allocation_rewards function
+pub fn execute_distribute_allocation_rewards(
+    mut deps: DepsMut,
     env: Env,
     info: MessageInfo,
 ) -> StdResult<Response> {
+    // Load the current state
+    let mut state = STATE.load(deps.storage)?;
+
+    // Check if the sender is the contract manager
+    if info.sender != state.contract_manager {
+        return Err(StdError::generic_err(
+            "Unauthorized: Only the contract manager can distribute allocation rewards",
+        ));
+    }
+
+    // Use the helper function to distribute rewards
+    let (total_rewards, time_elapsed, distribution_performed) = 
+        distribute_allocation_rewards(&mut deps, env.block.time, state.last_upkeep)?;
+    
+    // If no time elapsed, return error
+    if time_elapsed == 0 {
+        return Err(StdError::generic_err("No time has elapsed since last upkeep"));
+    }
+
+    // Update the last upkeep time
+    state.last_upkeep = env.block.time;
+    STATE.save(deps.storage, &state)?;
+
+    // Prepare the response based on whether distribution was performed
+    let mut response = Response::new()
+        .add_attribute("action", "distribute_allocation_rewards")
+        .add_attribute("time_elapsed", time_elapsed.to_string());
+    
+    if distribution_performed {
+        response = response.add_attribute("total_rewards_distributed", total_rewards.to_string());
+    } else {
+        response = response.add_attribute("result", "no allocations to update");
+    }
+
+    Ok(response)
+}
+
+// Update the execute_claim_staking_rewards function
+pub fn execute_claim_staking_rewards(
+    mut deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+) -> StdResult<Response> {
+    // First, load the current state
+    let mut state = STATE.load(deps.storage)?;
+    
+    // Use the helper function to distribute allocation rewards
+    let (total_rewards, time_elapsed, distribution_performed) = 
+        distribute_allocation_rewards(&mut deps, env.block.time, state.last_upkeep)?;
+    
+    // Update the last upkeep time if distribution was attempted
+    if time_elapsed > 0 {
+        state.last_upkeep = env.block.time;
+        STATE.save(deps.storage, &state)?;
+    }
+    
+    // Now continue with the normal staking rewards claim processing
     // Constants for rewards
     let reward_rate_per_second: Uint128 = Uint128::from(1_000_000u128); // 1,000,000 ERTH per second
-
-    // Load the current state
-    let state = STATE.load(deps.storage)?;
 
     let mut user_info = USER_INFO
         .get(deps.storage, &info.sender)
         .ok_or_else(|| StdError::generic_err("no user info found"))?;
-    let time_elapsed = env.block.time.seconds() - user_info.last_claim.seconds();
+    let claim_time_elapsed = env.block.time.seconds() - user_info.last_claim.seconds();
 
-    if time_elapsed > 0 {
+    if claim_time_elapsed > 0 {
         // Calculate the staker's share of rewards
         let staker_share = user_info.staked_amount
             * reward_rate_per_second
-            * Uint128::from(time_elapsed)
+            * Uint128::from(claim_time_elapsed)
             / state.total_staked;
 
         // Update the last reward time to the current time
@@ -503,12 +615,22 @@ pub fn execute_claim_staking_rewards(
             funds: vec![],
         });
 
-        // Create a response indicating the rewards have been claimed
-        Ok(Response::new()
+        // Create a response with all attributes
+        let mut response = Response::new()
             .add_message(message)
             .add_attribute("action", "claim_staking_rewards")
             .add_attribute("staker", info.sender.to_string())
-            .add_attribute("rewards_claimed", staker_share.to_string()))
+            .add_attribute("rewards_claimed", staker_share.to_string());
+        
+        // Add upkeep attributes if distribution was performed
+        if distribution_performed {
+            response = response
+                .add_attribute("upkeep_performed", "true")
+                .add_attribute("upkeep_time_elapsed", time_elapsed.to_string())
+                .add_attribute("upkeep_rewards_distributed", total_rewards.to_string());
+        }
+
+        Ok(response)
     } else {
         Err(StdError::generic_err("No rewards available to claim"))
     }

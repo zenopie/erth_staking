@@ -15,6 +15,7 @@ pub struct State {
     pub total_staked: Uint128,
     pub total_allocations: Uint128,
     pub allocation_counter: u32,
+    pub last_upkeep: Timestamp,
 }
 
 pub static STATE: Item<State> = Item::new(b"state");
@@ -22,6 +23,7 @@ pub static STATE: Item<State> = Item::new(b"state");
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 pub struct Allocation {
     pub allocation_id: u32,
+    pub accumulated_rewards: Uint128,
     pub recieve_addr: Addr,
     pub recieve_hash: Option<String>,
     pub manager_addr: Option<Addr>,
@@ -29,6 +31,7 @@ pub struct Allocation {
     pub use_send: bool,
     pub amount_allocated: Uint128,
     pub last_claim: Timestamp,
+
 }
 
 pub static ALLOCATION_OPTIONS: Item<Vec<Allocation>> = Item::new(b"allocation_options");

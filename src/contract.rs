@@ -216,9 +216,13 @@ pub fn execute_claim_allocation(
     // Get the accumulated rewards
     let rewards_to_claim = allocation.accumulated_rewards;
     
-    // If no rewards available, return an error
+    // If no rewards available, return a success response instead of an error
     if rewards_to_claim.is_zero() {
-        return Err(StdError::generic_err("No rewards available to claim"));
+        return Ok(Response::new()
+            .add_attribute("action", "claim_allocation")
+            .add_attribute("allocation_id", allocation_id.to_string())
+            .add_attribute("rewards_claimed", "0")
+            .add_attribute("message", "No rewards available to claim"));
     }
 
     let mut messages = Vec::new();
@@ -388,10 +392,12 @@ pub fn execute_withdraw(
 
     // Save the updated allocation options and state
     ALLOCATION_OPTIONS.save(deps.storage, &allocation_options)?;
-    STATE.save(deps.storage, &state)?;
-
+    
     // Subtract the withdrawn amount from total deposits in state
     state.total_staked -= amount;
+    
+    // Save the updated state AFTER modifying total_staked
+    STATE.save(deps.storage, &state)?;
 
     // Add the unbonding entry to UNBONDING_INFO
     let unbonding_period = 21 * 24 * 60 * 60; // 21 days in seconds
@@ -768,7 +774,9 @@ pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> StdResult<Response> 
     match msg {
         MigrateMsg::Migrate {} => {
             // Load the current state
-            let state = STATE.load(deps.storage)?;
+            let mut state = STATE.load(deps.storage)?;
+            
+
 
             // Register the contract as a receiver for the ERTH token
             let message = CosmosMsg::Wasm(WasmMsg::Execute {
@@ -780,9 +788,11 @@ pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> StdResult<Response> 
                 })?,
                 funds: vec![],
             });
+            
             Ok(Response::new()
                 .add_message(message)
-                .add_attribute("action", "migrate"))
+                .add_attribute("action", "migrate")
+            )
         }
     }
 }

@@ -774,7 +774,7 @@ pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> StdResult<Response> 
     match msg {
         MigrateMsg::Migrate {} => {
             // Load the current state
-            let mut state = STATE.load(deps.storage)?;
+            let state = STATE.load(deps.storage)?;
             
 
 
@@ -885,6 +885,27 @@ pub fn add_new_allocations(
     allocation_options: &mut [Allocation],
     state: &mut State,
 ) -> StdResult<Vec<UserAllocation>> {
+    // Check for duplicate allocation IDs
+    let mut seen_ids = std::collections::HashSet::new();
+    for percentage in percentages {
+        if !seen_ids.insert(percentage.allocation_id) {
+            return Err(StdError::generic_err(
+                "Duplicate allocation ID found. Each allocation ID must be unique.",
+            ));
+        }
+        
+        // Check that each allocation ID exists in the available options
+        let allocation_exists = allocation_options.iter().any(|allocation| {
+            allocation.allocation_id == percentage.allocation_id
+        });
+        
+        if !allocation_exists {
+            return Err(StdError::generic_err(
+                format!("Allocation ID {} does not exist", percentage.allocation_id),
+            ));
+        }
+    }
+
     let mut new_allocations: Vec<UserAllocation> = Vec::new();
     let mut total_percentage = Uint128::zero();
 

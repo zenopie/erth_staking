@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use cosmwasm_std::{Addr, Binary, Uint128};
 
-use crate::state::{Allocation, AllocationPercentage, State, UnbondingEntry, UserInfo};
+use crate::state::{AllocationPercentage, State, UnbondingEntry, UserInfo};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 pub struct InstantiateMsg {
@@ -76,18 +76,13 @@ pub enum QueryMsg {
     GetUserInfo {
         address: Addr,
     },
-    GetAllocationOptions {},
+    QueryAllocationOptions {},
 }
 
 // We define a custom struct for each query response
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 pub struct StateResponse {
     pub state: State,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
-pub struct AllocationOptionResponse {
-    pub allocations: Vec<Allocation>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]

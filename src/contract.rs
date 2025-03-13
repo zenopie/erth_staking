@@ -8,7 +8,7 @@ use secret_toolkit::snip20;
 
 use crate::msg::{
     ExecuteMsg, InstantiateMsg, MigrateMsg, QueryMsg, ReceiveMsg, SendMsg, StateResponse,
-    UserInfoResponse, AllocationOptionResponse,
+    UserInfoResponse,
 };
 use crate::state::{
     Allocation, AllocationPercentage,
@@ -801,7 +801,7 @@ pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> StdResult<Response> 
 pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
         QueryMsg::GetState {} => to_binary(&query_state(deps)?),
-        QueryMsg::GetAllocationOptions {} => to_binary(&query_allocation_options(deps)?),
+        QueryMsg::QueryAllocationOptions {} => to_binary(&query_allocation_options(deps)?),
         QueryMsg::GetUserInfo { address } => to_binary(&query_user_info(deps, env, address)?),
     }
 }
@@ -811,9 +811,9 @@ fn query_state(deps: Deps) -> StdResult<StateResponse> {
     Ok(StateResponse { state })
 }
 
-fn query_allocation_options(deps: Deps) -> StdResult<AllocationOptionResponse> {
+fn query_allocation_options(deps: Deps) -> StdResult<Vec<Allocation>> {
     let allocations = ALLOCATION_OPTIONS.load(deps.storage)?;
-    Ok(AllocationOptionResponse { allocations })
+    Ok(allocations)
 }
 
 pub fn query_user_info(deps: Deps, env: Env, address: Addr) -> StdResult<UserInfoResponse> {

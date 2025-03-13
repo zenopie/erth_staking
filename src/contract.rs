@@ -803,6 +803,7 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
         QueryMsg::GetState {} => to_binary(&query_state(deps)?),
         QueryMsg::QueryAllocationOptions {} => to_binary(&query_allocation_options(deps)?),
         QueryMsg::GetUserInfo { address } => to_binary(&query_user_info(deps, env, address)?),
+        QueryMsg::QueryUserAllocations { address } => to_binary(&query_user_allocations(deps, address)?),
     }
 }
 
@@ -860,6 +861,18 @@ pub fn query_user_info(deps: Deps, env: Env, address: Addr) -> StdResult<UserInf
     };
 
     Ok(user_info_response)
+}
+
+pub fn query_user_allocations(deps: Deps, address: String) -> StdResult<Vec<AllocationPercentage>> {
+    let addr = deps.api.addr_validate(&address)?;
+
+    // Load user info or return empty vector if not found
+    let user_info = USER_INFO.get(deps.storage, &addr);
+    
+    match user_info {
+        Some(info) => Ok(info.percentages),
+        None => Ok(Vec::new()) // Return empty vector if user not found
+    }
 }
 
 // Helper functions

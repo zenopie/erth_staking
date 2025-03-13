@@ -77,6 +77,9 @@ pub enum QueryMsg {
         address: Addr,
     },
     QueryAllocationOptions {},
+    QueryUserAllocations {
+        address: String,
+    },
 }
 
 // We define a custom struct for each query response

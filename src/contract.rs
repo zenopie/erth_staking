@@ -365,29 +365,40 @@ pub fn execute_withdraw(
     let mut allocation_options = ALLOCATION_OPTIONS.load(deps.storage)?;
     let mut state = STATE.load(deps.storage)?;
 
-    // Subtract the old allocations using the helper function
-    subtract_old_allocations(
-        &user_info.allocations,
-        &mut allocation_options,
-        &mut state,
-    );
-
-    if new_deposit_amount > Uint128::zero() {
-        // If there's still a deposit left, recalculate allocations
-        let new_allocations = add_new_allocations(
-            new_deposit_amount,
-            &user_info.percentages,
+    // Only process allocations if percentages is not empty
+    if !user_info.percentages.is_empty() {
+        // Subtract the old allocations using the helper function
+        subtract_old_allocations(
+            &user_info.allocations,
             &mut allocation_options,
             &mut state,
-        )?;
-        user_info.allocations = new_allocations;
-        user_info.staked_amount = new_deposit_amount;
+        );
 
-        // Save the updated user info back to storage
-        USER_INFO.insert(deps.storage, &info.sender, &user_info)?;
+        if new_deposit_amount > Uint128::zero() {
+            // If there's still a deposit left, recalculate allocations
+            let new_allocations = add_new_allocations(
+                new_deposit_amount,
+                &user_info.percentages,
+                &mut allocation_options,
+                &mut state,
+            )?;
+            user_info.allocations = new_allocations;
+            user_info.staked_amount = new_deposit_amount;
+
+            // Save the updated user info back to storage
+            USER_INFO.insert(deps.storage, &info.sender, &user_info)?;
+        } else {
+            // If the new deposit amount is zero, remove the user's info from storage
+            USER_INFO.remove(deps.storage, &info.sender)?;
+        }
     } else {
-        // If the new deposit amount is zero, remove the user's info from storage
-        USER_INFO.remove(deps.storage, &info.sender)?;
+        // If percentages is empty, just update the staked amount or remove user info
+        if new_deposit_amount > Uint128::zero() {
+            user_info.staked_amount = new_deposit_amount;
+            USER_INFO.insert(deps.storage, &info.sender, &user_info)?;
+        } else {
+            USER_INFO.remove(deps.storage, &info.sender)?;
+        }
     }
 
     // Save the updated allocation options and state

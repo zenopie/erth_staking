@@ -719,39 +719,45 @@ pub fn receive_stake(
     // Fetch existing user information or initialize it if not present
     let user_info: UserInfo = match USER_INFO.get(deps.storage, &from) {
         Some(mut existing_user_info) => {
-            // Load allocation options
-            let mut allocation_options = ALLOCATION_OPTIONS.load(deps.storage)?;
+            if existing_user_info.percentages.is_empty() {
+                // If percentages are empty, just update the staked amount
+                existing_user_info.staked_amount += amount;
+                existing_user_info
+            } else {
+                // Load allocation options
+                let mut allocation_options = ALLOCATION_OPTIONS.load(deps.storage)?;
 
-            // Subtract old allocations
-            subtract_old_allocations(
-                &existing_user_info.allocations,
-                &mut allocation_options,
-                &mut state,
-            );
+                // Subtract old allocations
+                subtract_old_allocations(
+                    &existing_user_info.allocations,
+                    &mut allocation_options,
+                    &mut state,
+                );
 
-            // Calculate the new total deposit amount
-            existing_user_info.staked_amount += amount;
+                // Calculate the new total deposit amount
+                existing_user_info.staked_amount += amount;
 
-            // Calculate new allocations using the helper function
-            let new_allocations = add_new_allocations(
-                existing_user_info.staked_amount,
-                &existing_user_info.percentages,
-                &mut allocation_options,
-                &mut state,
-            )?;
+                // Calculate new allocations using the helper function
+                let new_allocations = add_new_allocations(
+                    existing_user_info.staked_amount,
+                    &existing_user_info.percentages,
+                    &mut allocation_options,
+                    &mut state,
+                )?;
 
-            // Update the user information with new allocations
-            existing_user_info.allocations = new_allocations;
+                // Update the user information with new allocations
+                existing_user_info.allocations = new_allocations;
 
-            // Save the updated allocation options
-            ALLOCATION_OPTIONS.save(deps.storage, &allocation_options)?;
+                // Save the updated allocation options
+                ALLOCATION_OPTIONS.save(deps.storage, &allocation_options)?;
 
-            existing_user_info
+                existing_user_info
+            }
         }
         None => {
-            // Initialize new user info if not present
+            // Initialize new user info if not present with empty allocations
             UserInfo {
-                staked_amount: amount, // Directly set the new deposit amount
+                staked_amount: amount,
                 last_claim: env.block.time,
                 allocations: Vec::new(),
                 percentages: Vec::new(),

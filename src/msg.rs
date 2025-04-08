@@ -3,7 +3,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use cosmwasm_std::{Addr, Binary, Uint128};
+use cosmwasm_std::{Addr, Binary, Uint128, Timestamp};
 
 use crate::state::{AllocationPercentage, State, UnbondingEntry, UserInfo};
 
@@ -45,7 +45,11 @@ pub enum ExecuteMsg {
         memo: Option<String>,
         msg: Binary,
     },
-    ClaimUnbonded {}, // Added new execute message
+    ClaimUnbonded {},
+    CancelUnbond {
+        amount: Uint128,
+        unbonding_time: Timestamp,
+    }, 
     DistributeAllocationRewards {}, // New message for allocation rewards distribution
 }
 

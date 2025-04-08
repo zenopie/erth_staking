@@ -89,6 +89,10 @@ pub fn execute(
             claimer_addr,
             use_send,
         ),
+        ExecuteMsg::CancelUnbond {
+            amount,
+            unbonding_time,
+        } => execute_cancel_unbond(deps, env, info, amount, unbonding_time),
         ExecuteMsg::Receive {
             sender,
             from,
@@ -478,6 +482,106 @@ pub fn execute_claim_unbonded(
         .add_message(message)
         .add_attribute("action", "claim_unbonded")
         .add_attribute("amount", claimable_amount.to_string()))
+}
+
+pub fn execute_cancel_unbond(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    amount: Uint128,
+    unbonding_time: Timestamp,
+) -> StdResult<Response> {
+    // Load unbonding entries for the user, error if none found
+    let mut unbonding_entries = UNBONDING_INFO
+        .get(deps.storage, &info.sender)
+        .ok_or_else(|| StdError::generic_err("No unbonding entries found for this user"))?;
+
+    // Find and remove the entry with the matching amount and unbonding time
+    let mut found = false;
+    unbonding_entries.retain(|entry| {
+        if entry.amount == amount && entry.unbonding_time == unbonding_time {
+            found = true;
+            false // Remove this entry
+        } else {
+            true // Keep this entry
+        }
+    });
+
+    if !found {
+        return Err(StdError::generic_err("No matching unbonding entry found"));
+    }
+
+    // If empty, remove the entry entirely; otherwise, update it
+    if unbonding_entries.is_empty() {
+        UNBONDING_INFO.remove(deps.storage, &info.sender)?;
+    } else {
+        UNBONDING_INFO.insert(deps.storage, &info.sender, &unbonding_entries)?;
+    }
+
+    // Load the current state
+    let mut state = STATE.load(deps.storage)?;
+
+    // Handle the stake logic similar to receive_stake
+    let user_info: UserInfo = match USER_INFO.get(deps.storage, &info.sender) {
+        Some(mut existing_user_info) => {
+            if existing_user_info.percentages.is_empty() {
+                // If percentages are empty, just update the staked_amount
+                existing_user_info.staked_amount += amount;
+                existing_user_info
+            } else {
+                // Load allocation options
+                let mut allocation_options = ALLOCATION_OPTIONS.load(deps.storage)?;
+
+                // Subtract old allocations
+                subtract_old_allocations(
+                    &existing_user_info.allocations,
+                    &mut allocation_options,
+                    &mut state,
+                );
+
+                // Calculate the new total deposit amount
+                existing_user_info.staked_amount += amount;
+
+                // Calculate new allocations using the helper function
+                let new_allocations = add_new_allocations(
+                    existing_user_info.staked_amount,
+                    &existing_user_info.percentages,
+                    &mut allocation_options,
+                    &mut state,
+                )?;
+
+                // Update the user information with new allocations
+                existing_user_info.allocations = new_allocations;
+
+                // Save the updated allocation options
+                ALLOCATION_OPTIONS.save(deps.storage, &allocation_options)?;
+
+                existing_user_info
+            }
+        }
+        None => {
+            // If no USER_INFO exists (user fully withdrew previously), 
+            // treat this as a new stake with the canceled amount
+            UserInfo {
+                staked_amount: amount,
+                last_claim: env.block.time,
+                allocations: Vec::new(),
+                percentages: Vec::new(),
+            }
+        }
+    };
+
+    // Save the updated user information to storage
+    USER_INFO.insert(deps.storage, &info.sender, &user_info)?;
+
+    // Update the total staked amount in state
+    state.total_staked += amount;
+    STATE.save(deps.storage, &state)?;
+
+    Ok(Response::new()
+        .add_attribute("action", "cancel_unbond")
+        .add_attribute("amount", amount.to_string())
+        .add_attribute("unbonding_time", unbonding_time.seconds().to_string()))
 }
 
 // Add a helper function for distribution
